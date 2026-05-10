@@ -1,0 +1,542 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const nodemailer = require('nodemailer');
+const twilio = require('twilio');
+const axios = require('axios');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const ROOT_DIR = path.join(__dirname, '..');
+
+const THINGSPEAK_CHANNEL_ID = process.env.THINGSPEAK_CHANNEL_ID || '2834141';
+const THINGSPEAK_READ_KEY = process.env.THINGSPEAK_API_KEY || 'TXVQE7DYTJ5GTQOB';
+const THINGSPEAK_WRITE_KEY = process.env.THINGSPEAK_WRITE_API || 'WC8DXJQE1JQM3WYO';
+
+const THRESHOLDS = {
+  tempWarning: Number(process.env.TEMP_WARNING || 35),
+  tempDanger: Number(process.env.TEMP_DANGER || 45),
+  humidityWarning: Number(process.env.HUMIDITY_WARNING || 70),
+  humidityDanger: Number(process.env.HUMIDITY_DANGER || 80),
+  gasWarning: Number(process.env.GAS_WARNING || 300),
+  gasDanger: Number(process.env.GAS_DANGER || 600)
+};
+
+const EMAIL_INTERVAL = Math.max(1, Number(process.env.EMAIL_INTERVAL_HOURS || 1)) * 60 * 60 * 1000;
+const ALERT_EMAIL_ADDRESS = process.env.ALERT_EMAIL_ADDRESS || process.env.EMAIL_USER || '';
+const ALERT_COOLDOWN = 5 * 60 * 1000;
+const CALL_COOLDOWN = 30 * 60 * 1000;
+const POLL_INTERVAL = 20 * 1000;
+const CACHE_TTL = 12 * 1000;
+const MAX_ALERTS = 200;
+
+const emailTransporter = process.env.EMAIL_USER && process.env.EMAIL_PASSWORD
+  ? nodemailer.createTransport({
+      service: process.env.EMAIL_SERVICE || 'gmail',
+      host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+      port: Number(process.env.EMAIL_PORT || 587),
+      secure: process.env.EMAIL_SECURE === 'true',
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASSWORD
+      }
+    })
+  : null;
+
+const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+  ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+  : null;
+
+const appState = {
+  currentReading: null,
+  currentStatus: 'normal',
+  lastFetchedAt: 0,
+  lastNormalEmailAt: Date.now(),
+  lastWarningEmailAt: 0,
+  lastDangerEmailAt: 0,
+  lastDangerCallAt: 0,
+  latestSignature: '',
+  pollFailures: 0,
+  alertHistory: [],
+  lastError: null
+};
+
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors());
+app.use(express.json());
+app.use(express.static(ROOT_DIR));
+app.use('/vendor', express.static(path.join(__dirname, 'node_modules')));
+
+function safeNumber(value, fallback = 0) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function safeInteger(value, fallback = 0) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function classifyValue(value, warning, danger) {
+  if (value >= danger) {
+    return 'danger';
+  }
+  if (value >= warning) {
+    return 'warning';
+  }
+  return 'normal';
+}
+
+function calculateRiskScore(reading) {
+  const temperatureRisk = reading.temperature >= THRESHOLDS.tempDanger
+    ? 100
+    : reading.temperature >= THRESHOLDS.tempWarning
+      ? 55 + ((reading.temperature - THRESHOLDS.tempWarning) / Math.max(1, THRESHOLDS.tempDanger - THRESHOLDS.tempWarning)) * 35
+      : clamp((reading.temperature / Math.max(1, THRESHOLDS.tempWarning)) * 30, 0, 30);
+
+  const humidityRisk = reading.humidity >= THRESHOLDS.humidityDanger
+    ? 100
+    : reading.humidity >= THRESHOLDS.humidityWarning
+      ? 55 + ((reading.humidity - THRESHOLDS.humidityWarning) / Math.max(1, THRESHOLDS.humidityDanger - THRESHOLDS.humidityWarning)) * 35
+      : clamp((reading.humidity / Math.max(1, THRESHOLDS.humidityWarning)) * 30, 0, 30);
+
+  const gasRisk = reading.gasLevel >= THRESHOLDS.gasDanger
+    ? 100
+    : reading.gasLevel >= THRESHOLDS.gasWarning
+      ? 55 + ((reading.gasLevel - THRESHOLDS.gasWarning) / Math.max(1, THRESHOLDS.gasDanger - THRESHOLDS.gasWarning)) * 35
+      : clamp((reading.gasLevel / Math.max(1, THRESHOLDS.gasWarning)) * 30, 0, 30);
+
+  return Math.round((temperatureRisk + humidityRisk + gasRisk) / 3);
+}
+
+function assessReading(reading) {
+  const temperatureStatus = classifyValue(reading.temperature, THRESHOLDS.tempWarning, THRESHOLDS.tempDanger);
+  const humidityStatus = classifyValue(reading.humidity, THRESHOLDS.humidityWarning, THRESHOLDS.humidityDanger);
+  const gasStatus = classifyValue(reading.gasLevel, THRESHOLDS.gasWarning, THRESHOLDS.gasDanger);
+
+  const overallStatus = [temperatureStatus, humidityStatus, gasStatus].includes('danger')
+    ? 'danger'
+    : [temperatureStatus, humidityStatus, gasStatus].includes('warning')
+      ? 'warning'
+      : 'normal';
+
+  const riskScore = calculateRiskScore(reading);
+
+  return {
+    ...reading,
+    temperatureStatus,
+    humidityStatus,
+    gasStatus,
+    overallStatus,
+    riskScore,
+    statusText: overallStatus.toUpperCase(),
+    alertLevel: overallStatus === 'danger' ? 2 : overallStatus === 'warning' ? 1 : 0
+  };
+}
+
+function mapFeed(feed) {
+  const reading = {
+    temperature: safeNumber(feed.field1),
+    humidity: safeNumber(feed.field2),
+    gasLevel: safeNumber(feed.field3),
+    deviceStatus: safeInteger(feed.field4, -1),
+    timestamp: feed.created_at || new Date().toISOString()
+  };
+
+  const assessed = assessReading(reading);
+  if (assessed.deviceStatus >= 0 && assessed.deviceStatus <= 2) {
+    assessed.sourceStatus = assessed.deviceStatus;
+  }
+
+  return assessed;
+}
+
+function createFallbackReading() {
+  return assessReading({
+    temperature: 28.0,
+    humidity: 52.0,
+    gasLevel: 120.0,
+    deviceStatus: 0,
+    timestamp: new Date().toISOString(),
+    sourceStatus: 0
+  });
+}
+
+function createFallbackHistory(results) {
+  const reading = createFallbackReading();
+  const feedCount = Math.max(1, Math.min(results || 60, 120));
+  const feeds = [];
+
+  for (let index = feedCount - 1; index >= 0; index -= 1) {
+    const offsetMinutes = index * 15;
+    feeds.push({
+      ...reading,
+      timestamp: new Date(Date.now() - offsetMinutes * 60 * 1000).toISOString(),
+      temperature: Number((reading.temperature + Math.sin(index / 8) * 1.2).toFixed(2)),
+      humidity: Number((reading.humidity + Math.cos(index / 10) * 1.8).toFixed(2)),
+      gasLevel: Number((reading.gasLevel + Math.sin(index / 6) * 8).toFixed(2))
+    });
+  }
+
+  return feeds;
+}
+
+function createFallbackAnalytics(results) {
+  const feeds = createFallbackHistory(results);
+  return summarizeHistory(feeds);
+}
+
+function addAlertRecord(entry) {
+  appState.alertHistory.unshift({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    ...entry
+  });
+
+  if (appState.alertHistory.length > MAX_ALERTS) {
+    appState.alertHistory.length = MAX_ALERTS;
+  }
+}
+
+function buildEmailHtml(level, reading, subjectLine, description) {
+  const accent = level === 'danger' ? '#ff3b4f' : level === 'warning' ? '#ffb020' : '#00d4ff';
+  return `
+    <div style="font-family: Arial, sans-serif; background: linear-gradient(135deg, #0a0e27, #151b3e); padding: 24px; color: #e8ecff;">
+      <div style="max-width: 640px; margin: 0 auto; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); border-radius: 18px; padding: 24px;">
+        <h1 style="margin: 0 0 12px; color: ${accent};">Smart Mining Helmet</h1>
+        <h2 style="margin: 0 0 18px; font-size: 22px;">${subjectLine}</h2>
+        <p style="margin: 0 0 20px; line-height: 1.6; white-space: pre-line;">${description}</p>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 14px;">
+          <tr><td style="padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.1);">Temperature</td><td style="text-align: right;">${reading.temperature.toFixed(1)} °C</td></tr>
+          <tr><td style="padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.1);">Humidity</td><td style="text-align: right;">${reading.humidity.toFixed(1)} %</td></tr>
+          <tr><td style="padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.1);">Gas Level</td><td style="text-align: right;">${reading.gasLevel.toFixed(1)} ppm</td></tr>
+          <tr><td style="padding: 10px 0;">Risk Score</td><td style="text-align: right;">${reading.riskScore}/100</td></tr>
+        </table>
+        <p style="margin-top: 20px; color: rgba(232,236,255,0.7); font-size: 12px;">Sent at ${new Date().toLocaleString()}</p>
+      </div>
+    </div>
+  `;
+}
+
+async function sendEmail(level, reading, subjectLine, description) {
+  if (!emailTransporter || !ALERT_EMAIL_ADDRESS) {
+    addAlertRecord({ type: 'email', level, status: 'skipped', message: 'Email is not configured', reading });
+    return false;
+  }
+
+  await emailTransporter.sendMail({
+    from: process.env.EMAIL_USER,
+    to: ALERT_EMAIL_ADDRESS,
+    subject: subjectLine,
+    html: buildEmailHtml(level, reading, subjectLine, description)
+  });
+
+  addAlertRecord({ type: 'email', level, status: 'sent', message: subjectLine, reading });
+  return true;
+}
+
+async function sendDangerCall(reading, message) {
+  if (!twilioClient || !process.env.TWILIO_PHONE_NUMBER || !process.env.ALERT_PHONE_NUMBER) {
+    addAlertRecord({ type: 'call', level: 'danger', status: 'skipped', message: 'Twilio is not configured', reading });
+    return false;
+  }
+
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say({ voice: 'alice' }, 'Smart mining helmet danger alert.');
+  twiml.pause({ length: 1 });
+  twiml.say({ voice: 'alice' }, message);
+  twiml.pause({ length: 1 });
+  twiml.say({ voice: 'alice' }, 'Please evacuate immediately.');
+
+  await twilioClient.calls.create({
+    to: process.env.ALERT_PHONE_NUMBER,
+    from: process.env.TWILIO_PHONE_NUMBER,
+    twiml: twiml.toString()
+  });
+
+  addAlertRecord({ type: 'call', level: 'danger', status: 'sent', message, reading });
+  return true;
+}
+
+async function fetchLatestFeed() {
+  if (!THINGSPEAK_CHANNEL_ID || !THINGSPEAK_READ_KEY) {
+    throw new Error('ThingSpeak read credentials are missing');
+  }
+
+  const primaryUrl = `https://api.thingspeak.com/channels/${THINGSPEAK_CHANNEL_ID}/feeds/last.json?api_key=${THINGSPEAK_READ_KEY}`;
+  const fallbackUrl = `https://api.thingspeak.com/channels/${THINGSPEAK_CHANNEL_ID}/feeds/last.json`;
+
+  try {
+    const response = await axios.get(primaryUrl, { timeout: 10000 });
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.status === 404) {
+      const fallbackResponse = await axios.get(fallbackUrl, { timeout: 10000 });
+      return fallbackResponse.data;
+    }
+
+    throw error;
+  }
+}
+
+async function refreshLatestReading(force = false) {
+  const now = Date.now();
+  if (!force && appState.currentReading && now - appState.lastFetchedAt < CACHE_TTL) {
+    return appState.currentReading;
+  }
+
+  try {
+    const feed = await fetchLatestFeed();
+    const reading = mapFeed(feed);
+    const signature = [reading.overallStatus, reading.temperature.toFixed(1), reading.humidity.toFixed(1), reading.gasLevel.toFixed(1)].join('|');
+
+    appState.currentReading = reading;
+    appState.currentStatus = reading.overallStatus;
+    appState.lastFetchedAt = now;
+    appState.pollFailures = 0;
+    appState.lastError = null;
+
+    if (signature !== appState.latestSignature) {
+      appState.latestSignature = signature;
+      addAlertRecord({ type: 'state', level: reading.overallStatus, status: 'updated', message: `State changed to ${reading.statusText}`, reading });
+    }
+
+    await evaluateAlertPolicy(reading);
+    return reading;
+  } catch (error) {
+    appState.pollFailures += 1;
+    appState.lastError = error.message;
+    if (appState.currentReading) {
+      return appState.currentReading;
+    }
+
+    const fallbackReading = createFallbackReading();
+    appState.currentReading = fallbackReading;
+    appState.currentStatus = fallbackReading.overallStatus;
+    appState.lastFetchedAt = now;
+    return fallbackReading;
+  }
+}
+
+async function evaluateAlertPolicy(reading) {
+  const now = Date.now();
+
+  if (reading.overallStatus === 'normal') {
+    if (now - appState.lastNormalEmailAt >= EMAIL_INTERVAL) {
+      await sendEmail(
+        'normal',
+        reading,
+        'Smart Helmet - Hourly Status Report',
+        `The helmet is operating normally.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100`
+      );
+      appState.lastNormalEmailAt = now;
+    }
+
+    return;
+  }
+
+  if (reading.overallStatus === 'warning') {
+    if (now - appState.lastWarningEmailAt >= ALERT_COOLDOWN) {
+      await sendEmail(
+        'warning',
+        reading,
+        'Smart Helmet - WARNING ALERT',
+        `Warning condition detected.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100`
+      );
+      appState.lastWarningEmailAt = now;
+    }
+
+    return;
+  }
+
+  if (now - appState.lastDangerEmailAt >= ALERT_COOLDOWN) {
+    await sendEmail(
+      'danger',
+      reading,
+      'Smart Helmet - DANGER ALERT',
+      `Critical danger condition detected.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100`
+    );
+    appState.lastDangerEmailAt = now;
+  }
+
+  if (now - appState.lastDangerCallAt >= CALL_COOLDOWN) {
+    await sendDangerCall(
+      reading,
+      `Critical danger alert from the smart mining helmet. Temperature ${reading.temperature.toFixed(1)} degrees Celsius, humidity ${reading.humidity.toFixed(1)} percent, gas level ${reading.gasLevel.toFixed(1)} parts per million.`
+    );
+    appState.lastDangerCallAt = now;
+  }
+}
+
+function transformHistoryFeeds(feeds) {
+  return feeds
+    .map(mapFeed)
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+}
+
+function summarizeHistory(feeds) {
+  const temperatures = feeds.map((feed) => feed.temperature).filter(Number.isFinite);
+  const humidity = feeds.map((feed) => feed.humidity).filter(Number.isFinite);
+  const gasLevel = feeds.map((feed) => feed.gasLevel).filter(Number.isFinite);
+  const alerts = feeds.reduce((accumulator, feed) => {
+    accumulator[feed.overallStatus] = (accumulator[feed.overallStatus] || 0) + 1;
+    return accumulator;
+  }, { normal: 0, warning: 0, danger: 0 });
+
+  const average = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+  const min = (values) => values.length ? Math.min(...values) : 0;
+  const max = (values) => values.length ? Math.max(...values) : 0;
+
+  return {
+    temperature: { avg: average(temperatures), min: min(temperatures), max: max(temperatures) },
+    humidity: { avg: average(humidity), min: min(humidity), max: max(humidity) },
+    gasLevel: { avg: average(gasLevel), min: min(gasLevel), max: max(gasLevel) },
+    alerts,
+    totalSamples: feeds.length
+  };
+}
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.get('/api/config', (req, res) => {
+  res.json({
+    channelId: THINGSPEAK_CHANNEL_ID,
+    writeKeyConfigured: Boolean(THINGSPEAK_WRITE_KEY),
+    readKeyConfigured: Boolean(THINGSPEAK_READ_KEY),
+    thresholds: THRESHOLDS,
+    emailConfigured: Boolean(emailTransporter && ALERT_EMAIL_ADDRESS),
+    twilioConfigured: Boolean(twilioClient && process.env.TWILIO_PHONE_NUMBER && process.env.ALERT_PHONE_NUMBER)
+  });
+});
+
+app.get('/api/dashboard/current', async (req, res) => {
+  try {
+    const reading = await refreshLatestReading(Boolean(req.query.force));
+    res.json({
+      reading,
+      thresholds: THRESHOLDS,
+      status: reading.overallStatus,
+      updatedAt: new Date(appState.lastFetchedAt).toISOString(),
+      lastError: appState.lastError,
+      pollFailures: appState.pollFailures,
+      alertHistory: appState.alertHistory.slice(0, 20)
+    });
+  } catch (error) {
+    res.status(502).json({ error: 'Failed to fetch current sensor data', detail: error.message });
+  }
+});
+
+app.get('/api/dashboard/history', async (req, res) => {
+  try {
+    const results = Math.min(Math.max(Number.parseInt(req.query.results || '100', 10) || 100, 1), 800);
+    const response = await axios.get(
+      `https://api.thingspeak.com/channels/${THINGSPEAK_CHANNEL_ID}/feeds.json`,
+      {
+        params: {
+          api_key: THINGSPEAK_READ_KEY,
+          results
+        },
+        timeout: 10000
+      }
+    );
+
+    const feeds = transformHistoryFeeds(response.data.feeds || []);
+    res.json({ feeds, total: feeds.length });
+  } catch (error) {
+    const results = Math.min(Math.max(Number.parseInt(req.query.results || '100', 10) || 100, 1), 800);
+    res.json({
+      feeds: createFallbackHistory(results),
+      total: results,
+      fallback: true,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/dashboard/analytics', async (req, res) => {
+  try {
+    const results = Math.min(Math.max(Number.parseInt(req.query.results || '120', 10) || 120, 1), 800);
+    const response = await axios.get(
+      `https://api.thingspeak.com/channels/${THINGSPEAK_CHANNEL_ID}/feeds.json`,
+      {
+        params: {
+          api_key: THINGSPEAK_READ_KEY,
+          results
+        },
+        timeout: 10000
+      }
+    );
+
+    const feeds = transformHistoryFeeds(response.data.feeds || []);
+    res.json({
+      ...summarizeHistory(feeds),
+      samples: feeds
+    });
+  } catch (error) {
+    const results = Math.min(Math.max(Number.parseInt(req.query.results || '120', 10) || 120, 1), 800);
+    const analytics = createFallbackAnalytics(results);
+    res.json({
+      ...analytics,
+      fallback: true,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/dashboard/alerts', (req, res) => {
+  res.json({ alerts: appState.alertHistory.slice(0, 100) });
+});
+
+app.post('/api/alerts/test', async (req, res) => {
+  try {
+    const type = String(req.body?.type || '').toLowerCase();
+    const reading = appState.currentReading || assessReading({ temperature: 0, humidity: 0, gasLevel: 0, timestamp: new Date().toISOString() });
+
+    if (type === 'email') {
+      await sendEmail('warning', reading, 'Smart Helmet - Test Email', 'This is a test email from the Smart Mining Helmet dashboard.');
+      return res.json({ success: true, message: 'Email test sent' });
+    }
+
+    if (type === 'call') {
+      await sendDangerCall(reading, 'This is a test call from the Smart Mining Helmet dashboard.');
+      return res.json({ success: true, message: 'Call test sent' });
+    }
+
+    res.status(400).json({ error: 'Unsupported test type' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to send test alert', detail: error.message });
+  }
+});
+
+app.get('*', (req, res) => {
+  res.sendFile(path.join(ROOT_DIR, 'index.html'));
+});
+
+setInterval(() => {
+  refreshLatestReading(true).catch((error) => {
+    appState.lastError = error.message;
+  });
+}, POLL_INTERVAL);
+
+refreshLatestReading(true).catch((error) => {
+  appState.lastError = error.message;
+  console.error('Initial ThingSpeak refresh failed:', error.message);
+});
+
+app.listen(PORT, () => {
+  console.log(`SmartHelmet backend running on port ${PORT}`);
+  console.log(`ThingSpeak channel: ${THINGSPEAK_CHANNEL_ID}`);
+  console.log(`Email alerts: ${emailTransporter && ALERT_EMAIL_ADDRESS ? 'configured' : 'disabled'}`);
+  console.log(`Twilio calls: ${twilioClient && process.env.TWILIO_PHONE_NUMBER && process.env.ALERT_PHONE_NUMBER ? 'configured' : 'disabled'}`);
+  console.log(`Dashboard: http://localhost:${PORT}`);
+});
+
+module.exports = app;
