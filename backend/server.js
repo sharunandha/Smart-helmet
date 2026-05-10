@@ -60,7 +60,8 @@ const appState = {
   latestSignature: '',
   pollFailures: 0,
   alertHistory: [],
-  lastError: null
+  lastError: null,
+  isFallbackData: false
 };
 
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -301,6 +302,7 @@ async function refreshLatestReading(force = false) {
     appState.lastFetchedAt = now;
     appState.pollFailures = 0;
     appState.lastError = null;
+    appState.isFallbackData = false;
 
     if (signature !== appState.latestSignature) {
       appState.latestSignature = signature;
@@ -320,6 +322,7 @@ async function refreshLatestReading(force = false) {
     appState.currentReading = fallbackReading;
     appState.currentStatus = fallbackReading.overallStatus;
     appState.lastFetchedAt = now;
+    appState.isFallbackData = true;
     return fallbackReading;
   }
 }
@@ -329,13 +332,18 @@ async function evaluateAlertPolicy(reading) {
 
   if (reading.overallStatus === 'normal') {
     if (now - appState.lastNormalEmailAt >= EMAIL_INTERVAL) {
-      await sendEmail(
-        'normal',
-        reading,
-        'Smart Helmet - Hourly Status Report',
-        `The helmet is operating normally.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100`
-      );
-      appState.lastNormalEmailAt = now;
+      try {
+        await sendEmail(
+          'normal',
+          reading,
+          'Smart Helmet - Hourly Status Report',
+          `The helmet is operating normally.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100`
+        );
+        appState.lastNormalEmailAt = now;
+      } catch (error) {
+        console.error('❌ Failed to send hourly email:', error.message);
+        addAlertRecord({ type: 'email', level: 'normal', status: 'failed', message: `Email send failed: ${error.message}`, reading });
+      }
     }
 
     return;
@@ -343,26 +351,34 @@ async function evaluateAlertPolicy(reading) {
 
   if (reading.overallStatus === 'warning') {
     if (now - appState.lastWarningEmailAt >= ALERT_COOLDOWN) {
-      await sendEmail(
-        'warning',
-        reading,
-        'Smart Helmet - WARNING ALERT',
-        `Warning condition detected.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100`
-      );
-      appState.lastWarningEmailAt = now;
+      try {
+        await sendEmail(
+          'warning',
+          reading,
+          'Smart Helmet - WARNING ALERT',
+          `Warning condition detected.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100`
+        );
+        appState.lastWarningEmailAt = now;
+      } catch (error) {
+        console.error('❌ Failed to send warning email:', error.message);
+      }
     }
 
     return;
   }
 
   if (now - appState.lastDangerEmailAt >= ALERT_COOLDOWN) {
-    await sendEmail(
-      'danger',
-      reading,
-      'Smart Helmet - DANGER ALERT',
-      `Critical danger condition detected.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100`
-    );
-    appState.lastDangerEmailAt = now;
+    try {
+      await sendEmail(
+        'danger',
+        reading,
+        'Smart Helmet - DANGER ALERT',
+        `Critical danger condition detected.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100`
+      );
+      appState.lastDangerEmailAt = now;
+    } catch (error) {
+      console.error('❌ Failed to send danger email:', error.message);
+    }
   }
 
   if (now - appState.lastDangerCallAt >= CALL_COOLDOWN) {
@@ -427,7 +443,8 @@ app.get('/api/dashboard/current', async (req, res) => {
       updatedAt: new Date(appState.lastFetchedAt).toISOString(),
       lastError: appState.lastError,
       pollFailures: appState.pollFailures,
-      alertHistory: appState.alertHistory.slice(0, 20)
+      alertHistory: appState.alertHistory.slice(0, 20),
+      isFallback: appState.isFallbackData
     });
   } catch (error) {
     res.status(502).json({ error: 'Failed to fetch current sensor data', detail: error.message });
@@ -495,24 +512,87 @@ app.get('/api/dashboard/alerts', (req, res) => {
   res.json({ alerts: appState.alertHistory.slice(0, 100) });
 });
 
-app.post('/api/alerts/test', async (req, res) => {
+async function handleTestAlert(req, res) {
   try {
     const type = String(req.body?.type || '').toLowerCase();
     const reading = appState.currentReading || assessReading({ temperature: 0, humidity: 0, gasLevel: 0, timestamp: new Date().toISOString() });
 
     if (type === 'email') {
-      await sendEmail('warning', reading, 'Smart Helmet - Test Email', 'This is a test email from the Smart Mining Helmet dashboard.');
+      const sent = await sendEmail('warning', reading, 'Smart Helmet - Test Email', 'This is a test email from the Smart Mining Helmet dashboard.');
+      if (!sent) {
+        return res.status(503).json({ error: 'Email alerts are not configured' });
+      }
+
       return res.json({ success: true, message: 'Email test sent' });
     }
 
     if (type === 'call') {
-      await sendDangerCall(reading, 'This is a test call from the Smart Mining Helmet dashboard.');
+      const sent = await sendDangerCall(reading, 'This is a test call from the Smart Mining Helmet dashboard.');
+      if (!sent) {
+        return res.status(503).json({ error: 'Twilio calls are not configured' });
+      }
+
       return res.json({ success: true, message: 'Call test sent' });
     }
 
     res.status(400).json({ error: 'Unsupported test type' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to send test alert', detail: error.message });
+  }
+}
+
+app.post('/api/alerts/test', handleTestAlert);
+
+app.post('/api/alert/test', handleTestAlert);
+
+app.post('/api/alerts/trigger-danger', async (req, res) => {
+  try {
+    const dangerReading = {
+      temperature: THRESHOLDS.tempDanger + 5,
+      humidity: THRESHOLDS.humidityDanger + 5,
+      gasLevel: THRESHOLDS.gasDanger + 100,
+      deviceStatus: 2,
+      timestamp: new Date().toISOString()
+    };
+    const reading = assessReading(dangerReading);
+    appState.currentReading = reading;
+    appState.currentStatus = 'danger';
+    
+    await sendEmail(
+      'danger',
+      reading,
+      'Smart Helmet - DANGER TRIGGER TEST',
+      `Manual danger trigger test activated.\n\nTemperature: ${reading.temperature.toFixed(1)} °C\nHumidity: ${reading.humidity.toFixed(1)} %\nGas Level: ${reading.gasLevel.toFixed(1)} ppm\nRisk Score: ${reading.riskScore}/100\n\nThis is a TEST ALERT triggered from the dashboard.`
+    );
+    
+    addAlertRecord({ type: 'test', level: 'danger', status: 'triggered', message: 'Danger trigger test - danger email sent', reading });
+    return res.json({ success: true, message: 'Danger test triggered and email sent', reading });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to trigger danger test', detail: error.message });
+  }
+});
+
+app.post('/api/alerts/send-hourly-email', async (req, res) => {
+  try {
+    const { reading } = req.body;
+    if (!reading) {
+      return res.status(400).json({ error: 'Reading data is required' });
+    }
+    
+    const processedReading = assessReading(reading);
+    
+    // Send hourly status email
+    await sendEmail(
+      'hourly',
+      processedReading,
+      'Smart Helmet - Hourly Status Report',
+      `Hourly status report for Smart Helmet IoT system.\n\nTemperature: ${processedReading.temperature.toFixed(1)} °C\nHumidity: ${processedReading.humidity.toFixed(1)} %\nGas Level: ${processedReading.gasLevel.toFixed(1)} ppm\nRisk Score: ${processedReading.riskScore}/100\nStatus: ${processedReading.status.toUpperCase()}\n\nThis is a periodic status report.`
+    );
+    
+    addAlertRecord({ type: 'hourly', level: 'normal', status: 'sent', message: 'Hourly status email sent', reading: processedReading });
+    return res.json({ success: true, message: 'Hourly email sent successfully', reading: processedReading });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to send hourly email', detail: error.message });
   }
 });
 

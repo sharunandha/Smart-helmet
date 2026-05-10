@@ -852,6 +852,11 @@ async function refreshCurrent(force = false) {
         }
 
         const payload = await response.json();
+        
+        if (payload.isFallback) {
+            throw new Error('No real data from ThingSpeak - using fallback');
+        }
+        
         const reading = normalizeReading(payload);
         const statusChanged = reading.status !== state.currentStatus;
 
@@ -910,6 +915,9 @@ async function refreshHistory() {
         }
 
         const payload = await response.json();
+        if (payload.fallback) {
+            throw new Error('No real history from ThingSpeak');
+        }
         state.history = Array.isArray(payload.feeds) ? payload.feeds : [];
         renderCharts(state.history);
         return state.history;
@@ -927,6 +935,9 @@ async function refreshAnalytics() {
         }
 
         const payload = await response.json();
+        if (payload.fallback) {
+            throw new Error('No real analytics from ThingSpeak');
+        }
         state.analytics = payload;
         renderChartsFromAnalytics(payload);
         return payload;
@@ -1031,6 +1042,44 @@ async function testPhoneAlert() {
     }
 }
 
+async function triggerDangerTest() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/alerts/trigger-danger`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+            throw new Error(payload.error || 'Danger trigger failed');
+        }
+        showToast('🚨 Danger test triggered! Check your email for alert.', 'danger');
+        console.log('Danger trigger response:', payload);
+        setTimeout(() => refreshData(), 1000);
+    } catch (error) {
+        showToast(error.message, 'danger');
+    }
+}
+
+async function sendImmediateHourlyEmail() {
+    try {
+        if (!state.current) {
+            return;
+        }
+        const response = await fetch(`${API_BASE_URL}/alerts/send-hourly-email`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reading: state.current })
+        });
+        const payload = await response.json();
+        if (response.ok) {
+            console.log('✅ Hourly email sent successfully');
+            showToast('📧 Hourly status email sent', 'normal');
+        }
+    } catch (error) {
+        console.error('❌ Failed to send hourly email:', error.message);
+    }
+}
+
 function saveSettings() {
     saveState();
     showToast('Dashboard preferences saved locally.', 'normal');
@@ -1128,6 +1177,11 @@ function bindEvents() {
     const testBuzzerButton = el('testBuzzer');
     if (testBuzzerButton) {
         testBuzzerButton.addEventListener('click', testBuzzer);
+    }
+    
+    const testDangerButton = el('testDangerTrigger');
+    if (testDangerButton) {
+        testDangerButton.addEventListener('click', triggerDangerTest);
     }
 
     document.addEventListener('visibilitychange', () => {
@@ -1396,6 +1450,21 @@ function initializeApp() {
 
     fetchConfig()
         .then(() => refreshData())
+        .then(() => {
+            // Send immediate hourly email on page load
+            setTimeout(() => {
+                if (state.current && state.current.status === 'normal') {
+                    sendImmediateHourlyEmail();
+                }
+            }, 500);
+            
+            // Send hourly email every 60 minutes
+            setInterval(() => {
+                if (state.current && state.current.status === 'normal') {
+                    sendImmediateHourlyEmail();
+                }
+            }, 60 * 60 * 1000);
+        })
         .finally(() => {
             if (state.autoRefresh) {
                 startPolling();
@@ -1416,6 +1485,8 @@ window.refreshData = refreshData;
 window.toggleAutoRefresh = toggleAutoRefresh;
 window.testEmailAlert = testEmailAlert;
 window.testPhoneAlert = testPhoneAlert;
+window.triggerDangerTest = triggerDangerTest;
+window.sendImmediateHourlyEmail = sendImmediateHourlyEmail;
 window.saveSettings = saveSettings;
 window.resetSettings = resetSettings;
 window.testBuzzer = testBuzzer;

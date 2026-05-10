@@ -1,5 +1,5 @@
 // Configuration
-const API_BASE_URL = 'http://localhost:5000/api'; // Change to your server URL
+const API_BASE_URL = 'http://localhost:3000/api'; // Change to your server URL
 const UPDATE_INTERVAL = 5000; // 5 seconds
 const CHART_UPDATE_INTERVAL = 30000; // 30 seconds
 let autoRefreshEnabled = true;
@@ -8,7 +8,7 @@ let charts = {};
 
 // ThingSpeak (set to true to fetch directly from ThingSpeak instead of local API)
 const USE_THINGSPEAK = true;
-const THINGSPEAK_CHANNEL_ID = '3376690';
+const THINGSPEAK_CHANNEL_ID = '2834141';
 const THINGSPEAK_READ_API_KEY = 'KPDGJ1L61ON5GZSJ';
 const THINGSPEAK_FEEDS_URL = `https://api.thingspeak.com/channels/${THINGSPEAK_CHANNEL_ID}/feeds.json?api_key=${THINGSPEAK_READ_API_KEY}&results=1`;
 
@@ -626,12 +626,15 @@ function toggleAutoRefresh() {
 
 async function testEmailAlert() {
     try {
-        const response = await fetch(`${API_BASE_URL}/alert/test`, {
+        const response = await fetch(`${API_BASE_URL}/alerts/test`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ type: 'email' })
         });
         const result = await response.json();
+        if (!response.ok) {
+            throw new Error(result.error || 'Failed to send test email');
+        }
         showNotification('✅ Test email sent!');
         console.log('Test email response:', result);
     } catch (error) {
@@ -642,12 +645,15 @@ async function testEmailAlert() {
 
 async function testPhoneAlert() {
     try {
-        const response = await fetch(`${API_BASE_URL}/alert/test`, {
+        const response = await fetch(`${API_BASE_URL}/alerts/test`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ type: 'call' })
         });
         const result = await response.json();
+        if (!response.ok) {
+            throw new Error(result.error || 'Failed to initiate test call');
+        }
         showNotification('📞 Test call initiated!');
         console.log('Test call response:', result);
     } catch (error) {
