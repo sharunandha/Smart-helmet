@@ -8,8 +8,8 @@ let charts = {};
 
 // ThingSpeak (set to true to fetch directly from ThingSpeak instead of local API)
 const USE_THINGSPEAK = true;
-const THINGSPEAK_CHANNEL_ID = '2834141';
-const THINGSPEAK_READ_API_KEY = 'KPDGJ1L61ON5GZSJ';
+const THINGSPEAK_CHANNEL_ID = '3376690';
+const THINGSPEAK_READ_API_KEY = '8JKU7MB5273R0GQQ';
 const THINGSPEAK_FEEDS_URL = `https://api.thingspeak.com/channels/${THINGSPEAK_CHANNEL_ID}/feeds.json?api_key=${THINGSPEAK_READ_API_KEY}&results=1`;
 
 // Sensor data storage
@@ -27,6 +27,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.log('🚀 Smart Helmet Dashboard Initializing...');
     initializeCharts();
     await refreshData();
+    await updateCharts();
     initialize3DHelmet();
     
     // Set up auto-refresh
@@ -379,14 +380,66 @@ function updateGauges() {
 
 async function updateCharts() {
     try {
-        // Fetch history
-        const historyResponse = await fetch(`${API_BASE_URL}/sensors/history?results=100`);
-        const history = await historyResponse.json();
-        
-        // Fetch analytics
-        const analyticsResponse = await fetch(`${API_BASE_URL}/analytics`);
-        const analytics = await analyticsResponse.json();
-        
+        let history = [];
+        let analytics = null;
+
+        if (USE_THINGSPEAK) {
+            const historyUrl = `https://api.thingspeak.com/channels/${THINGSPEAK_CHANNEL_ID}/feeds.json?api_key=${THINGSPEAK_READ_API_KEY}&results=100`;
+            const historyResponse = await fetch(historyUrl);
+            if (!historyResponse.ok) throw new Error('ThingSpeak history API error');
+            const payload = await historyResponse.json();
+
+            history = (payload.feeds || []).map((feed) => {
+                const temperature = parseFloat(feed.field1) || 0;
+                const humidity = parseFloat(feed.field2) || 0;
+                const gasLevel = parseFloat(feed.field3) || 0;
+                let status = 'normal';
+                if (temperature >= 45 || gasLevel >= 800) {
+                    status = 'danger';
+                } else if (temperature >= 35 || gasLevel >= 400) {
+                    status = 'warning';
+                }
+
+                return {
+                    timestamp: feed.created_at,
+                    temperature,
+                    humidity,
+                    gasLevel,
+                    overallStatus: status
+                };
+            });
+
+            const count = history.length || 1;
+            const totals = history.reduce((acc, row) => {
+                acc.temperature += row.temperature;
+                acc.humidity += row.humidity;
+                acc.gasLevel += row.gasLevel;
+                acc.alerts[row.overallStatus] += 1;
+                return acc;
+            }, {
+                temperature: 0,
+                humidity: 0,
+                gasLevel: 0,
+                alerts: { normal: 0, warning: 0, danger: 0 }
+            });
+
+            analytics = {
+                temperature: { avg: (totals.temperature / count).toFixed(2) },
+                humidity: { avg: (totals.humidity / count).toFixed(2) },
+                gasLevel: { avg: (totals.gasLevel / count).toFixed(2) },
+                alerts: totals.alerts
+            };
+        } else {
+            const historyResponse = await fetch(`${API_BASE_URL}/dashboard/history?results=100`);
+            if (!historyResponse.ok) throw new Error('History API error');
+            const historyPayload = await historyResponse.json();
+            history = historyPayload.feeds || [];
+
+            const analyticsResponse = await fetch(`${API_BASE_URL}/dashboard/analytics?results=100`);
+            if (!analyticsResponse.ok) throw new Error('Analytics API error');
+            analytics = await analyticsResponse.json();
+        }
+
         if (history.length > 0) {
             // Update line charts
             const labels = history.map(d => {
@@ -413,7 +466,11 @@ async function updateCharts() {
             charts.gasLine.data.datasets[0].data = gases;
             charts.gasLine.update();
         }
-        
+
+        if (!analytics || !analytics.alerts) {
+            return;
+        }
+
         // Update alert pie chart
         charts.alertPie.data.datasets[0].data = [
             analytics.alerts.normal,
@@ -421,17 +478,18 @@ async function updateCharts() {
             analytics.alerts.danger
         ];
         charts.alertPie.update();
-        
+
         // Update statistics
-        document.getElementById('statAvgTemp').textContent = 
-            analytics.temperature.avg + ' °C';
-        document.getElementById('statAvgHumidity').textContent = 
-            analytics.humidity.avg + ' %';
-        document.getElementById('statAvgGas').textContent = 
-            analytics.gasLevel.avg + ' ppm';
-        document.getElementById('statTotalAlerts').textContent = 
-            (analytics.alerts.warning + analytics.alerts.danger) + ' 🚨';
-        
+        const statAvgTemp = document.getElementById('statAvgTemp');
+        const statAvgHumidity = document.getElementById('statAvgHumidity');
+        const statAvgGas = document.getElementById('statAvgGas');
+        const statTotalAlerts = document.getElementById('statTotalAlerts');
+
+        if (statAvgTemp) statAvgTemp.textContent = `${analytics.temperature.avg} °C`;
+        if (statAvgHumidity) statAvgHumidity.textContent = `${analytics.humidity.avg} %`;
+        if (statAvgGas) statAvgGas.textContent = `${analytics.gasLevel.avg} ppm`;
+        if (statTotalAlerts) statTotalAlerts.textContent = `${analytics.alerts.warning + analytics.alerts.danger} 🚨`;
+
     } catch (error) {
         console.error('❌ Error updating charts:', error);
     }

@@ -15,8 +15,8 @@ const state = {
         gasDanger: 600
     },
     thinkSpeakConfig: {
-        channelId: '2834141',
-        apiKey: 'TXVQE7DYTJ5GTQOB',
+        channelId: '3376690',
+        apiKey: '8JKU7MB5273R0GQQ',
         updateInterval: 15
     },
     alerts: [],
@@ -307,8 +307,6 @@ function triggerAlert(level, message) {
     // Trigger buzzer
     if (level === 'danger') {
         triggerBuzzer('danger');
-        // Trigger Twilio call
-        sendTwilioAlert(message);
     } else if (level === 'warning') {
         triggerBuzzer('warning');
     }
@@ -492,28 +490,7 @@ async function sendEmailAlert(level, message) {
     }
 }
 
-// ============ TWILIO CALL ALERTS ============
-async function sendTwilioAlert(message) {
-    try {
-        const response = await fetch('/api/send-twilio-alert', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                message,
-                deviceId: state.deviceId,
-                timestamp: new Date().toISOString()
-            })
-        });
-
-        if (response.ok) {
-            console.log('Twilio alert triggered');
-        }
-    } catch (error) {
-        console.error('Error sending Twilio alert:', error);
-    }
-}
+// Twilio call alerts removed: phone alerts disabled
 
 // ============ CHARTS ============
 let charts = {};
@@ -843,7 +820,6 @@ window.SmartHelmet = {
     fetchThinkSpeakData,
     triggerAlert,
     sendEmailAlert,
-    sendTwilioAlert
 };
 
 // Initialize on page load

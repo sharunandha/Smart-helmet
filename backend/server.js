@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const nodemailer = require('nodemailer');
-const twilio = require('twilio');
 const axios = require('axios');
 const path = require('path');
 
@@ -11,8 +10,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ROOT_DIR = path.join(__dirname, '..');
 
-const THINGSPEAK_CHANNEL_ID = process.env.THINGSPEAK_CHANNEL_ID || '2834141';
-const THINGSPEAK_READ_KEY = process.env.THINGSPEAK_API_KEY || 'TXVQE7DYTJ5GTQOB';
+const THINGSPEAK_CHANNEL_ID = process.env.THINGSPEAK_CHANNEL_ID || '3376690';
+const THINGSPEAK_READ_KEY = process.env.THINGSPEAK_API_KEY || '8JKU7MB5273R0GQQ';
 const THINGSPEAK_WRITE_KEY = process.env.THINGSPEAK_WRITE_API || 'WC8DXJQE1JQM3WYO';
 
 const THRESHOLDS = {
@@ -45,9 +44,7 @@ const emailTransporter = process.env.EMAIL_USER && process.env.EMAIL_PASSWORD
     })
   : null;
 
-const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
-  ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-  : null;
+// Twilio removed: phone-call alerts disabled
 
 const appState = {
   currentReading: null,
@@ -242,28 +239,7 @@ async function sendEmail(level, reading, subjectLine, description) {
   return true;
 }
 
-async function sendDangerCall(reading, message) {
-  if (!twilioClient || !process.env.TWILIO_PHONE_NUMBER || !process.env.ALERT_PHONE_NUMBER) {
-    addAlertRecord({ type: 'call', level: 'danger', status: 'skipped', message: 'Twilio is not configured', reading });
-    return false;
-  }
-
-  const twiml = new twilio.twiml.VoiceResponse();
-  twiml.say({ voice: 'alice' }, 'Smart mining helmet danger alert.');
-  twiml.pause({ length: 1 });
-  twiml.say({ voice: 'alice' }, message);
-  twiml.pause({ length: 1 });
-  twiml.say({ voice: 'alice' }, 'Please evacuate immediately.');
-
-  await twilioClient.calls.create({
-    to: process.env.ALERT_PHONE_NUMBER,
-    from: process.env.TWILIO_PHONE_NUMBER,
-    twiml: twiml.toString()
-  });
-
-  addAlertRecord({ type: 'call', level: 'danger', status: 'sent', message, reading });
-  return true;
-}
+// sendDangerCall removed: Twilio-based phone alerts disabled per configuration
 
 async function fetchLatestFeed() {
   if (!THINGSPEAK_CHANNEL_ID || !THINGSPEAK_READ_KEY) {
@@ -428,8 +404,7 @@ app.get('/api/config', (req, res) => {
     writeKeyConfigured: Boolean(THINGSPEAK_WRITE_KEY),
     readKeyConfigured: Boolean(THINGSPEAK_READ_KEY),
     thresholds: THRESHOLDS,
-    emailConfigured: Boolean(emailTransporter && ALERT_EMAIL_ADDRESS),
-    twilioConfigured: Boolean(twilioClient && process.env.TWILIO_PHONE_NUMBER && process.env.ALERT_PHONE_NUMBER)
+    emailConfigured: Boolean(emailTransporter && ALERT_EMAIL_ADDRESS)
   });
 });
 
@@ -526,14 +501,7 @@ async function handleTestAlert(req, res) {
       return res.json({ success: true, message: 'Email test sent' });
     }
 
-    if (type === 'call') {
-      const sent = await sendDangerCall(reading, 'This is a test call from the Smart Mining Helmet dashboard.');
-      if (!sent) {
-        return res.status(503).json({ error: 'Twilio calls are not configured' });
-      }
-
-      return res.json({ success: true, message: 'Call test sent' });
-    }
+    // Call tests removed - phone alerts disabled
 
     res.status(400).json({ error: 'Unsupported test type' });
   } catch (error) {
@@ -615,7 +583,6 @@ app.listen(PORT, () => {
   console.log(`SmartHelmet backend running on port ${PORT}`);
   console.log(`ThingSpeak channel: ${THINGSPEAK_CHANNEL_ID}`);
   console.log(`Email alerts: ${emailTransporter && ALERT_EMAIL_ADDRESS ? 'configured' : 'disabled'}`);
-  console.log(`Twilio calls: ${twilioClient && process.env.TWILIO_PHONE_NUMBER && process.env.ALERT_PHONE_NUMBER ? 'configured' : 'disabled'}`);
   console.log(`Dashboard: http://localhost:${PORT}`);
 });
 
