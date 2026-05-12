@@ -228,12 +228,16 @@ async function sendEmail(level, reading, subjectLine, description) {
     return false;
   }
 
-  await emailTransporter.sendMail({
-    from: process.env.EMAIL_USER,
+  const mailOptions = {
+    from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
     to: ALERT_EMAIL_ADDRESS,
     subject: subjectLine,
     html: buildEmailHtml(level, reading, subjectLine, description)
-  });
+  };
+
+  // Verifies SMTP credentials once per send path so failures are explicit in logs.
+  await emailTransporter.verify();
+  await emailTransporter.sendMail(mailOptions);
 
   addAlertRecord({ type: 'email', level, status: 'sent', message: subjectLine, reading });
   return true;
@@ -508,6 +512,19 @@ async function handleTestAlert(req, res) {
     res.status(500).json({ error: 'Failed to send test alert', detail: error.message });
   }
 }
+
+app.get('/api/alerts/email-status', async (req, res) => {
+  try {
+    if (!emailTransporter || !ALERT_EMAIL_ADDRESS) {
+      return res.json({ configured: false, reason: 'missing email credentials' });
+    }
+
+    await emailTransporter.verify();
+    return res.json({ configured: true, verified: true, from: process.env.EMAIL_FROM || process.env.EMAIL_USER, to: ALERT_EMAIL_ADDRESS });
+  } catch (error) {
+    return res.status(500).json({ configured: true, verified: false, error: error.message });
+  }
+});
 
 app.post('/api/alerts/test', handleTestAlert);
 
