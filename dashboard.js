@@ -328,7 +328,7 @@ function renderAlertList() {
     `).join('');
 
     if (alertList) {
-        alertList.innerHTML = markup || '<div class="alert-history-item">No alerts recorded yet.</div>';
+        alertList.innerHTML = markup || `<div class="alert-history-item">${state.currentFilter === 'all' ? 'No alerts recorded yet.' : `No ${state.currentFilter} alerts recorded yet.`}</div>`;
     }
 
     if (alertsSection) {
@@ -346,7 +346,7 @@ function renderAlertList() {
                     <button class="btn-dismiss" type="button" data-alert-id="${alert.id}">Dismiss</button>
                 </div>
             </div>
-        `).join('') || '<div class="alert-item"><div class="alert-content"><h4>No alerts</h4><p>The system is stable right now.</p></div></div>';
+        `).join('') || formatAlertEmptyState(state.currentFilter);
 
         alertsSection.querySelectorAll('.btn-dismiss').forEach((button) => {
             button.addEventListener('click', () => {
@@ -369,9 +369,35 @@ function filterAlerts(type) {
     return state.alerts;
 }
 
+function getAlertCounts() {
+    return state.alerts.reduce((counts, alert) => {
+        const level = String(alert.level || alert.status || 'normal').toLowerCase();
+        if (level === 'normal' || level === 'warning' || level === 'danger') {
+            counts[level] += 1;
+        }
+        counts.all += 1;
+        return counts;
+    }, { all: 0, normal: 0, warning: 0, danger: 0 });
+}
+
+function formatAlertEmptyState(filter) {
+    if (filter === 'warning') {
+        return '<div class="alert-item"><div class="alert-content"><h4>No warning alerts</h4><p>There are no warning-level events recorded yet.</p></div></div>';
+    }
+
+    if (filter === 'danger') {
+        return '<div class="alert-item"><div class="alert-content"><h4>No danger alerts</h4><p>There are no critical events recorded yet.</p></div></div>';
+    }
+
+    return '<div class="alert-item"><div class="alert-content"><h4>No alerts</h4><p>The system is stable right now.</p></div></div>';
+}
+
 function updateAlertFilterButtons(activeFilter) {
+    const counts = getAlertCounts();
     document.querySelectorAll('.alert-filter-btn').forEach((button) => {
         button.classList.toggle('active', button.dataset.alert === activeFilter);
+        const baseLabel = button.dataset.alert === 'all' ? 'All' : button.dataset.alert === 'warning' ? 'Warning' : 'Danger';
+        button.textContent = `${baseLabel} (${counts[button.dataset.alert] ?? 0})`;
     });
 }
 
