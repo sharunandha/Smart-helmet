@@ -1594,4 +1594,4 @@ window.saveSettings = saveSettings;
 window.resetSettings = resetSettings;
 window.testBuzzer = testBuzzer;
 window.updateChartsTimeRange = updateChartsTimeRange;
-window.filterAlerts = filterAlertSection;
+window.filterAlertSection = filterAlertSection;
