@@ -236,8 +236,7 @@ async function sendEmail(level, reading, subjectLine, description) {
       html: buildEmailHtml(level, reading, subjectLine, description)
     };
 
-    // Verifies SMTP credentials once per send path so failures are explicit in logs.
-    await emailTransporter.verify();
+    // Send mail directly without verification to avoid timeouts on misconfigured SMTP
     await emailTransporter.sendMail(mailOptions);
 
     addAlertRecord({ type: 'email', level, status: 'sent', message: subjectLine, reading });
