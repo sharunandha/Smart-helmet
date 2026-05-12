@@ -85,7 +85,8 @@ function loadState() {
     try {
         const parsed = JSON.parse(raw);
         state.thresholds = { ...DEFAULT_THRESHOLDS, ...(parsed.thresholds || {}) };
-        state.autoRefresh = parsed.autoRefresh ?? true;
+        // Keep live mode always on so sensor cards do not freeze.
+        state.autoRefresh = true;
         state.soundEnabled = parsed.soundEnabled ?? false;
         state.browserNotifications = parsed.browserNotifications ?? true;
         state.timeRange = parsed.timeRange || '24h';
@@ -846,7 +847,7 @@ async function fetchConfig() {
 
 async function refreshCurrent(force = false) {
     try {
-        const response = await fetch(`${API_BASE_URL}/dashboard/current${force ? '?force=1' : ''}`);
+        const response = await fetch(`${API_BASE_URL}/dashboard/current${force ? '?force=1' : ''}`, { cache: 'no-store' });
         if (!response.ok) {
             throw new Error('Unable to fetch current reading');
         }
@@ -880,6 +881,13 @@ async function refreshCurrent(force = false) {
         renderEventLog();
         return reading;
     } catch (error) {
+        if (state.current) {
+            // Preserve the latest known values and mark the stream as retrying.
+            updateConnectionState(true, 'warning');
+            addEventLogEntry('sync', `Live sync retry: ${error.message}`, 'warning', new Date().toISOString());
+            return state.current;
+        }
+
         updateConnectionState(false, 'Disconnected');
         showToast(`Sensor sync failed: ${error.message}`, 'danger');
         return null;
@@ -975,11 +983,8 @@ async function refreshData() {
 function startPolling() {
     stopPolling();
 
-    if (!state.autoRefresh) {
-        return;
-    }
-
-    state.polling.current = setInterval(refreshCurrent, POLL_INTERVAL);
+    // Always force a fresh pull for live values.
+    state.polling.current = setInterval(() => refreshCurrent(true), POLL_INTERVAL);
     state.polling.history = setInterval(refreshHistory, HISTORY_INTERVAL);
     state.polling.analytics = setInterval(refreshAnalytics, ANALYTICS_INTERVAL);
     state.polling.alerts = setInterval(refreshAlerts, HISTORY_INTERVAL);
@@ -996,16 +1001,12 @@ function stopPolling() {
 }
 
 function toggleAutoRefresh() {
-    state.autoRefresh = !state.autoRefresh;
-    el('autoRefreshStatus').textContent = state.autoRefresh ? 'ON' : 'OFF';
+    state.autoRefresh = true;
+    el('autoRefreshStatus').textContent = 'ON';
     saveState();
-    if (state.autoRefresh) {
-        startPolling();
-        showToast('Auto refresh enabled.', 'normal');
-    } else {
-        stopPolling();
-        showToast('Auto refresh paused.', 'warning');
-    }
+    startPolling();
+    refreshCurrent(true);
+    showToast('Live mode is always on.', 'normal');
 }
 
 async function testEmailAlert() {
@@ -1466,9 +1467,7 @@ function initializeApp() {
             }, 60 * 60 * 1000);
         })
         .finally(() => {
-            if (state.autoRefresh) {
-                startPolling();
-            }
+            startPolling();
         });
 
     setTimeout(() => {
