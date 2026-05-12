@@ -236,8 +236,13 @@ async function sendEmail(level, reading, subjectLine, description) {
       html: buildEmailHtml(level, reading, subjectLine, description)
     };
 
-    // Send mail directly without verification to avoid timeouts on misconfigured SMTP
-    await emailTransporter.sendMail(mailOptions);
+    // Send mail with timeout to prevent hanging on misconfigured SMTP
+    const sendPromise = emailTransporter.sendMail(mailOptions);
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Email send timeout after 5s')), 5000)
+    );
+    
+    await Promise.race([sendPromise, timeoutPromise]);
 
     addAlertRecord({ type: 'email', level, status: 'sent', message: subjectLine, reading });
     return true;
