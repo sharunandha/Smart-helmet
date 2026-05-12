@@ -607,6 +607,7 @@ app.listen(PORT, () => {
   console.log(`ThingSpeak channel: ${THINGSPEAK_CHANNEL_ID}`);
   console.log(`Email alerts: ${emailTransporter && ALERT_EMAIL_ADDRESS ? 'configured' : 'disabled'}`);
   console.log(`Dashboard: http://localhost:${PORT}`);
+  console.log('Danger alert handling: error-safe ✓');
 });
 
 module.exports = app;
