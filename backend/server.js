@@ -228,19 +228,25 @@ async function sendEmail(level, reading, subjectLine, description) {
     return false;
   }
 
-  const mailOptions = {
-    from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
-    to: ALERT_EMAIL_ADDRESS,
-    subject: subjectLine,
-    html: buildEmailHtml(level, reading, subjectLine, description)
-  };
+  try {
+    const mailOptions = {
+      from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
+      to: ALERT_EMAIL_ADDRESS,
+      subject: subjectLine,
+      html: buildEmailHtml(level, reading, subjectLine, description)
+    };
 
-  // Verifies SMTP credentials once per send path so failures are explicit in logs.
-  await emailTransporter.verify();
-  await emailTransporter.sendMail(mailOptions);
+    // Verifies SMTP credentials once per send path so failures are explicit in logs.
+    await emailTransporter.verify();
+    await emailTransporter.sendMail(mailOptions);
 
-  addAlertRecord({ type: 'email', level, status: 'sent', message: subjectLine, reading });
-  return true;
+    addAlertRecord({ type: 'email', level, status: 'sent', message: subjectLine, reading });
+    return true;
+  } catch (error) {
+    console.error('Email send failed:', error.message);
+    addAlertRecord({ type: 'email', level, status: 'failed', message: `Email failed: ${error.message}`, reading });
+    return false;
+  }
 }
 
 // sendDangerCall removed: Twilio-based phone alerts disabled per configuration
