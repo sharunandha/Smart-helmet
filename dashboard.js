@@ -1,4 +1,5 @@
 const API_BASE_URL = '/api';
+const DEVICE_ID = '3376690';
 const DEFAULT_THRESHOLDS = {
     tempWarning: 35,
     tempDanger: 45,
@@ -11,6 +12,12 @@ const STORAGE_KEY = 'smart-helmet-dashboard-v2';
 const POLL_INTERVAL = 10000;
 const HISTORY_INTERVAL = 30000;
 const ANALYTICS_INTERVAL = 60000;
+const TIME_RANGE_WINDOWS = {
+    '1h': 60 * 60 * 1000,
+    '6h': 6 * 60 * 60 * 1000,
+    '24h': 24 * 60 * 60 * 1000,
+    '7d': 7 * 24 * 60 * 60 * 1000
+};
 
 const state = {
     thresholds: { ...DEFAULT_THRESHOLDS },
@@ -103,19 +110,68 @@ function applyStateToSettings() {
     }
 }
 
-function getChartSampleCount() {
-    switch (state.timeRange) {
-        case '1h':
-            return 240;
-        case '6h':
-            return 720;
-        case '24h':
-            return 800;
-        case '7d':
-            return 800;
-        default:
-            return 800;
+function applyDeviceId(channelId = DEVICE_ID) {
+    state.config = state.config || {};
+    state.deviceId = String(channelId || DEVICE_ID);
+
+    const deviceIdElement = el('deviceId');
+    if (deviceIdElement) {
+        deviceIdElement.textContent = state.deviceId;
     }
+
+    updateThinkSpeakLink(state.deviceId);
+}
+
+function getChartSampleCount() {
+    return 800;
+}
+
+function getTimeRangeWindowMs() {
+    return TIME_RANGE_WINDOWS[state.timeRange] || TIME_RANGE_WINDOWS['24h'];
+}
+
+function getReadingTimestamp(reading) {
+    const timestamp = new Date(reading?.timestamp || Date.now()).getTime();
+    return Number.isFinite(timestamp) ? timestamp : Date.now();
+}
+
+function filterReadingsByTimeRange(readings) {
+    if (!Array.isArray(readings) || readings.length === 0) {
+        return [];
+    }
+
+    const windowMs = getTimeRangeWindowMs();
+    const sorted = [...readings].sort((a, b) => getReadingTimestamp(a) - getReadingTimestamp(b));
+    const newestTimestamp = getReadingTimestamp(sorted[sorted.length - 1]);
+    const earliestAllowed = newestTimestamp - windowMs;
+
+    const filtered = sorted.filter((reading) => getReadingTimestamp(reading) >= earliestAllowed);
+    return filtered.length ? filtered : sorted.slice(-Math.min(sorted.length, 1));
+}
+
+function summarizeReadings(readings) {
+    const list = Array.isArray(readings) ? readings : [];
+    const temperatures = list.map((reading) => Number(reading.temperature)).filter(Number.isFinite);
+    const humidity = list.map((reading) => Number(reading.humidity)).filter(Number.isFinite);
+    const gasLevel = list.map((reading) => Number(reading.gasLevel)).filter(Number.isFinite);
+
+    const counts = list.reduce((accumulator, reading) => {
+        const status = String(reading.overallStatus || reading.status || 'normal').toLowerCase();
+        accumulator[status] = (accumulator[status] || 0) + 1;
+        return accumulator;
+    }, { normal: 0, warning: 0, danger: 0 });
+
+    const average = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+    const min = (values) => values.length ? Math.min(...values) : 0;
+    const max = (values) => values.length ? Math.max(...values) : 0;
+
+    return {
+        temperature: { avg: average(temperatures), min: min(temperatures), max: max(temperatures) },
+        humidity: { avg: average(humidity), min: min(humidity), max: max(humidity) },
+        gasLevel: { avg: average(gasLevel), min: min(gasLevel), max: max(gasLevel) },
+        alerts: counts,
+        totalSamples: list.length
+    };
 }
 
 function computeLocalStatus(reading) {
@@ -304,10 +360,19 @@ function renderAlertList() {
 
 function filterAlerts(type) {
     if (type && type !== 'all') {
-        return state.alerts.filter((alert) => String(alert.level || '').toLowerCase() === type);
+        return state.alerts.filter((alert) => {
+            const level = String(alert.level || alert.status || '').toLowerCase();
+            return level === type;
+        });
     }
 
     return state.alerts;
+}
+
+function updateAlertFilterButtons(activeFilter) {
+    document.querySelectorAll('.alert-filter-btn').forEach((button) => {
+        button.classList.toggle('active', button.dataset.alert === activeFilter);
+    });
 }
 
 function updateStatisticsFromAnalytics(analytics) {
@@ -835,7 +900,7 @@ async function fetchConfig() {
         }
         const data = await response.json();
         state.config = data;
-        updateThinkSpeakLink(data.channelId);
+        applyDeviceId(data.channelId || DEVICE_ID);
         if (data.thresholds) {
             state.thresholds = { ...state.thresholds, ...data.thresholds };
             applyStateToSettings();
@@ -917,7 +982,7 @@ function updateBannerAndConnection(reading, payload) {
 
 async function refreshHistory() {
     try {
-        const response = await fetch(`${API_BASE_URL}/dashboard/history?results=${getChartSampleCount()}`);
+        const response = await fetch(`${API_BASE_URL}/dashboard/history?results=${getChartSampleCount()}`, { cache: 'no-store' });
         if (!response.ok) {
             throw new Error('Unable to fetch history');
         }
@@ -926,7 +991,8 @@ async function refreshHistory() {
         if (payload.fallback) {
             throw new Error('No real history from ThingSpeak');
         }
-        state.history = Array.isArray(payload.feeds) ? payload.feeds : [];
+        const feeds = Array.isArray(payload.feeds) ? payload.feeds : [];
+        state.history = filterReadingsByTimeRange(feeds);
         renderCharts(state.history);
         return state.history;
     } catch (error) {
@@ -937,7 +1003,7 @@ async function refreshHistory() {
 
 async function refreshAnalytics() {
     try {
-        const response = await fetch(`${API_BASE_URL}/dashboard/analytics?results=${getChartSampleCount()}`);
+        const response = await fetch(`${API_BASE_URL}/dashboard/analytics?results=${getChartSampleCount()}`, { cache: 'no-store' });
         if (!response.ok) {
             throw new Error('Unable to fetch analytics');
         }
@@ -946,9 +1012,11 @@ async function refreshAnalytics() {
         if (payload.fallback) {
             throw new Error('No real analytics from ThingSpeak');
         }
-        state.analytics = payload;
-        renderChartsFromAnalytics(payload);
-        return payload;
+        const samples = filterReadingsByTimeRange(Array.isArray(payload.samples) ? payload.samples : []);
+        const summary = summarizeReadings(samples);
+        state.analytics = { ...summary, samples };
+        renderChartsFromAnalytics(state.analytics);
+        return state.analytics;
     } catch (error) {
         showToast(`Analytics sync failed: ${error.message}`, 'warning');
         return null;
@@ -1231,6 +1299,7 @@ function updateChartsTimeRange(filter) {
 
 function filterAlertSection(filter) {
     state.currentFilter = filter || 'all';
+    updateAlertFilterButtons(state.currentFilter);
     saveState();
     renderAlertList();
 }
@@ -1437,13 +1506,16 @@ function initializeBackground3D() {
 function initializeApp() {
     loadState();
     applyStateToSettings();
+    applyDeviceId(DEVICE_ID);
+    document.querySelectorAll('.filter-btn').forEach((item) => item.classList.toggle('active', item.dataset.filter === state.timeRange));
+    updateAlertFilterButtons(state.currentFilter);
     bindEvents();
     injectButtons();
     initCharts();
     initialize3DHelmet();
     initializeBackground3D();
     updateConnectionState(true, 'Connected');
-    updateThinkSpeakLink('2834141');
+    updateThinkSpeakLink(DEVICE_ID);
 
     if ('Notification' in window && state.browserNotifications && Notification.permission === 'default') {
         Notification.requestPermission().catch(() => {});
