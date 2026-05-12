@@ -314,7 +314,13 @@ function renderEventLog() {
 function renderAlertList() {
     const alertList = el('alertHistory');
     const alertsSection = document.querySelector('.alerts-list');
-    const alerts = filterAlerts(state.currentFilter);
+    let alerts = filterAlerts(state.currentFilter);
+
+    if (state.currentFilter !== 'all' && alerts.length === 0 && state.alerts.length > 0) {
+        state.currentFilter = 'all';
+        updateAlertFilterButtons(state.currentFilter);
+        alerts = state.alerts;
+    }
 
     const markup = alerts.slice(0, 10).map((alert) => `
         <div class="alert-history-item ${alert.level === 'danger' ? 'danger' : ''}">
